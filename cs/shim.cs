@@ -4,7 +4,6 @@
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
-using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -38,6 +37,26 @@ namespace Scoop
         {
             public IntPtr hProcess, hThread;
             public int dwProcessId, dwThreadId;
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        struct SHELLEXECUTEINFOW
+        {
+            public int cbSize;
+            public uint fMask;
+            public IntPtr hwnd;
+            [MarshalAs(UnmanagedType.LPWStr)] public string? lpVerb;
+            [MarshalAs(UnmanagedType.LPWStr)] public string lpFile;
+            [MarshalAs(UnmanagedType.LPWStr)] public string? lpParameters;
+            [MarshalAs(UnmanagedType.LPWStr)] public string? lpDirectory;
+            public int nShow;
+            public IntPtr hInstApp;
+            public IntPtr lpIDList;
+            [MarshalAs(UnmanagedType.LPWStr)] public string? lpClass;
+            public IntPtr hkeyClass;
+            public uint dwHotKey;
+            public IntPtr hIcon;      // union with hMonitor
+            public IntPtr hProcess;
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -92,6 +111,10 @@ namespace Scoop
 
         [DllImport("kernel32.dll", SetLastError = true)]
         static extern uint ResumeThread(IntPtr hThread);
+
+        [DllImport("shell32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        static extern bool ShellExecuteExW(ref SHELLEXECUTEINFOW lpExecInfo);
 
         // --- P/Invoke: Job Object ---
 
@@ -160,14 +183,32 @@ namespace Scoop
         [return: MarshalAs(UnmanagedType.Bool)]
         static extern bool SetEnvironmentVariableW(string lpName, string lpValue);
 
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern IntPtr GetStdHandle(uint nStdHandle);
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        static extern bool WriteConsoleW(IntPtr hConsole, string lpBuffer, uint nChars, out uint lpCharsWritten, IntPtr lpReserved);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        static extern bool WriteFile(IntPtr hFile, byte[] lpBuffer, uint nBytesToWrite, out uint lpBytesWritten, IntPtr lpOverlapped);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern uint GetFileType(IntPtr hFile);
+
         // --- Constants ---
 
         const uint CREATE_SUSPENDED = 0x00000004;
         const uint INFINITE = 0xFFFFFFFF;
+        const uint WAIT_OBJECT_0 = 0x00000000;
+        const uint SEE_MASK_NOCLOSEPROCESS = 0x00000040;
+        const int SW_SHOW = 5;
         const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
         const uint JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK = 0x00001000;
         const int JobObjectExtendedLimitInformation = 9;
         const int ATTACH_PARENT_PROCESS = -1;
+
+        const int MAX_MODULE_PATH_CHARS = 32768;
 
         const uint GENERIC_READ = 0x80000000;
         const uint GENERIC_WRITE = 0x40000000;
@@ -206,33 +247,62 @@ namespace Scoop
             public List<string> Args = new List<string>();
             public string? Cwd;
             public bool Elevate;
-            public Dictionary<string, string> EnvVars = new Dictionary<string, string>();
+            public Dictionary<string, string> EnvVars = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         }
 
         // --- Helpers ---
 
+        const uint STD_ERROR_HANDLE = 0xFFFFFFF4 - 0; // (DWORD)-12
+        const uint FILE_TYPE_CHAR = 2;
+
+        static void WriteErrorW(string msg)
+        {
+            IntPtr hErr = GetStdHandle(STD_ERROR_HANDLE);
+            if (hErr == IntPtr.Zero || hErr == new IntPtr(-1)) return;
+            if (GetFileType(hErr) == FILE_TYPE_CHAR)
+            {
+                WriteConsoleW(hErr, msg, (uint)msg.Length, out _, IntPtr.Zero);
+                return;
+            }
+            byte[] bytes = Encoding.UTF8.GetBytes(msg);
+            WriteFile(hErr, bytes, (uint)bytes.Length, out _, IntPtr.Zero);
+        }
+
+        static void WriteErrorSys(uint err)
+        {
+            WriteErrorW(" (error " + err + ": " + new Win32Exception((int)err).Message.TrimEnd() + ").");
+        }
+
         // Win32Exception.Message renders the system error text in the OS language.
         static void ReportShimError(string context, uint error)
         {
-            Console.Error.WriteLine($"Shim: {context} (error {error}: {new Win32Exception((int)error).Message}).");
+            WriteErrorW("Shim: " + context);
+            WriteErrorSys(error);
+            WriteErrorW("\n");
         }
 
         static string GetModulePath()
         {
             var sb = new StringBuilder(260);
-            uint len = GetModuleFileNameW(IntPtr.Zero, sb, sb.Capacity);
-            if (len == 0)
+            for (; ; )
             {
-                ReportShimError("The filename of the program could not be determined", (uint)Marshal.GetLastWin32Error());
-                return null!;
+                uint len = GetModuleFileNameW(IntPtr.Zero, sb, sb.Capacity);
+                if (len == 0)
+                {
+                    ReportShimError("The filename of the program could not be determined", (uint)Marshal.GetLastWin32Error());
+                    return null!;
+                }
+                if (len < sb.Capacity)
+                    return sb.ToString(0, (int)len);
+
+                // Win 8.1+: the return value is the required size, so retry with a buffer that fits.
+                if (len >= MAX_MODULE_PATH_CHARS)
+                {
+                    WriteErrorW("Shim: The filename of the program is too long to handle: '" + sb + "'.\n");
+                    return null!;
+                }
+                sb = new StringBuilder((int)len + 1);
             }
-            if (len >= sb.Capacity)
-            {
-                var truncated = sb.ToString(0, Math.Min((int)len, sb.Length));
-                Console.Error.WriteLine($"Shim: The filename of the program is too long to handle: '{truncated}'.");
-                return null!;
-            }
-            return sb.ToString(0, (int)len);
         }
 
         static bool IsGuiSubsystem()
@@ -313,6 +383,11 @@ namespace Scoop
             }
         }
 
+        static bool IsKey(string key, string expected)
+        {
+            return string.Equals(key, expected, StringComparison.OrdinalIgnoreCase);
+        }
+
         static string NormalizeArgs(string args, string curDir)
         {
             if (string.IsNullOrEmpty(args)) return args;
@@ -322,7 +397,7 @@ namespace Scoop
                 replacement += "\\";
 
             int pos = 0;
-            while ((pos = args.IndexOf("%~dp0", pos, StringComparison.Ordinal)) >= 0)
+            while ((pos = args.IndexOf("%~dp0", pos, StringComparison.OrdinalIgnoreCase)) >= 0)
             {
                 args = args.Remove(pos, 5).Insert(pos, replacement);
                 pos += replacement.Length;
@@ -388,28 +463,25 @@ namespace Scoop
             return result.ToString();
         }
 
-        static string BuildCommandLine(string exePath, List<string> args)
+        static string JoinQuoted(List<string> args, string prefix)
         {
-            var cmd = new StringBuilder();
-            cmd.Append(QuoteArg(exePath));
-            foreach (var arg in args)
-            {
-                cmd.Append(' ');
-                cmd.Append(QuoteArg(arg));
-            }
-            return cmd.ToString();
-        }
-
-        // No exe prefix - elevated launch takes parameters separately from the file.
-        static string BuildParams(List<string> args)
-        {
-            var sb = new StringBuilder();
+            var sb = new StringBuilder(prefix);
             for (int i = 0; i < args.Count; i++)
             {
-                if (i > 0) sb.Append(' ');
+                if (i > 0 || prefix.Length > 0) sb.Append(' ');
                 sb.Append(QuoteArg(args[i]));
             }
             return sb.ToString();
+        }
+
+        static string BuildCommandLine(string exePath, List<string> args)
+        {
+            return JoinQuoted(args, QuoteArg(exePath));
+        }
+
+        static string BuildParams(List<string> args)
+        {
+            return JoinQuoted(args, "");
         }
 
         static List<string> ParseArgsFromCmdLine(string cmdLine)
@@ -457,11 +529,7 @@ namespace Scoop
 
         static void EnsureStandardHandles(ref STARTUPINFO si)
         {
-            // GUI launches have no console; attach to the parent console so the
-            // CON*$ opens below succeed. Failure is fine (no parent console).
-            if (IsGuiSubsystem())
-                AttachConsole(ATTACH_PARENT_PROCESS);
-
+            // Console policy lives in Main; a detached GUI shim has no console, so the opens below fail.
             var sa = new SECURITY_ATTRIBUTES();
             sa.nLength = Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES));
             sa.lpSecurityDescriptor = IntPtr.Zero;
@@ -517,7 +585,7 @@ namespace Scoop
             var targetDir = dir;
             foreach (var rawLine in lines)
             {
-                if (!TryParseLine(rawLine, out var key, out var value) || key != "path")
+                if (!TryParseLine(rawLine, out var key, out var value) || !IsKey(key, "path"))
                     continue;
 
                 // %~dp0 in the path field refers to the shim's own dir.
@@ -532,7 +600,7 @@ namespace Scoop
             {
                 if (!TryParseLine(rawLine, out var key, out var value)) continue;
 
-                if (key == "path")
+                if (IsKey(key, "path"))
                 {
                     // First path wins; %~dp0 here means the shim's own dir.
                     if (info.Path == null)
@@ -542,17 +610,17 @@ namespace Scoop
                             info.Path = pv;
                     }
                 }
-                else if (key == "args")
+                else if (IsKey(key, "args"))
                 {
                     string normalized = NormalizeArgs(value!, targetDir);
                     if (!string.IsNullOrEmpty(normalized))
                         info.Args = ParseArgsFromCmdLine(normalized);
                 }
-                else if (key == "cwd" || key == "workdir")
+                else if (IsKey(key, "cwd") || IsKey(key, "workdir"))
                 {
                     info.Cwd = ExpandAndUnquote(NormalizeArgs(value!, targetDir));
                 }
-                else if (key == "elevate" || key == "runas")
+                else if (IsKey(key, "elevate") || IsKey(key, "runas"))
                 {
                     info.Elevate = ParseBool(value!);
                 }
@@ -563,14 +631,12 @@ namespace Scoop
             }
 
             if (info.Path == null)
-                Console.Error.WriteLine($"Shim: 'path' not found in shim file '{configPath}'.");
+                WriteErrorW("Shim: 'path' not found in shim file '" + configPath + "'.\n");
 
             return info;
         }
         static int LaunchProcess(ShimInfo info, IntPtr jobHandle)
         {
-            if (string.IsNullOrEmpty(info.Path)) return -1;
-
             foreach (var kv in info.EnvVars)
             {
                 if (!SetEnvironmentVariableW(kv.Key, kv.Value))
@@ -600,7 +666,10 @@ namespace Scoop
                 ref si, out pi))
             {
                 if (jobHandle != IntPtr.Zero)
-                    AssignProcessToJobObject(jobHandle, pi.hProcess);
+                {
+                    if (!AssignProcessToJobObject(jobHandle, pi.hProcess))
+                        ReportShimError("Could not assign process to job object", (uint)Marshal.GetLastWin32Error());
+                }
 
                 ResumeThread(pi.hThread);
 
@@ -621,46 +690,54 @@ namespace Scoop
 
         static int LaunchElevated(string path, string params_, string? cwd, IntPtr jobHandle)
         {
-            var psi = new ProcessStartInfo
+            var sei = new SHELLEXECUTEINFOW
             {
-                FileName = path,
-                Arguments = params_,
-                UseShellExecute = true,
-                Verb = "runas"
+                cbSize = Marshal.SizeOf(typeof(SHELLEXECUTEINFOW)),
+                fMask = SEE_MASK_NOCLOSEPROCESS,
+                lpVerb = "runas",
+                lpFile = path,
+                lpParameters = params_.Length == 0 ? null : params_,
+                lpDirectory = string.IsNullOrEmpty(cwd) ? null : cwd,
+                nShow = SW_SHOW
             };
 
-            if (!string.IsNullOrEmpty(cwd))
-                psi.WorkingDirectory = cwd;
-
-            try
+            if (!ShellExecuteExW(ref sei))
             {
-                var process = Process.Start(psi);
-                if (process is null)
-                {
-                    // Process.Start returned null without a reliable last-error;
-                    // report a fixed code like cpp (ERROR_INVALID_FUNCTION = 1).
-                    ReportShimError("Unable to create elevated process", 1);
-                    return 1;
-                }
-
-                if (jobHandle != IntPtr.Zero)
-                    AssignProcessToJobObject(jobHandle, process.Handle);
-
-                process.WaitForExit();
-                int exitCode = process.ExitCode;
-                process.Close();
-                return exitCode;
-            }
-            catch (Win32Exception ex)
-            {
-                ReportShimError("Unable to create elevated process", (uint)ex.NativeErrorCode);
+                // On failure hInstApp holds SE_ERR_* (<=32); 0 maps to ERROR_INVALID_FUNCTION.
+                uint err = (uint)sei.hInstApp.ToInt64();
+                if (err > 32)
+                    err = (uint)Marshal.GetLastWin32Error();
+                if (err == 0)
+                    err = 1;
+                ReportShimError("Unable to create elevated process", err);
                 return 1;
             }
+
+            IntPtr hProcess = sei.hProcess;
+            if (hProcess == IntPtr.Zero)
+            {
+                ReportShimError("Unable to create elevated process", 1);
+                return 1;
+            }
+
+            if (jobHandle != IntPtr.Zero)
+            {
+                if (!AssignProcessToJobObject(jobHandle, hProcess))
+                    ReportShimError("Could not assign process to job object", (uint)Marshal.GetLastWin32Error());
+            }
+
+            return WaitAndGetExitCode(hProcess);
         }
 
         static int WaitAndGetExitCode(IntPtr hProcess)
         {
-            WaitForSingleObject(hProcess, INFINITE);
+            uint wait = WaitForSingleObject(hProcess, INFINITE);
+            if (wait != WAIT_OBJECT_0)
+            {
+                ReportShimError("Could not wait for process to exit", (uint)Marshal.GetLastWin32Error());
+                CloseHandle(hProcess);
+                return 1;
+            }
 
             // Init to 1 so a failed query yields 1, not 0 (mirrors cpp).
             uint exitCode = 1;
@@ -706,8 +783,11 @@ namespace Scoop
                 var jeli = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
                 jeli.BasicLimitInformation.LimitFlags =
                     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK;
-                SetInformationJobObject(jobHandle, JobObjectExtendedLimitInformation,
-                    ref jeli, (uint)Marshal.SizeOf(typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION)));
+                if (!SetInformationJobObject(jobHandle, JobObjectExtendedLimitInformation,
+                    ref jeli, (uint)Marshal.SizeOf(typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION))))
+                {
+                    ReportShimError("Could not configure job object", (uint)Marshal.GetLastWin32Error());
+                }
             }
 
             // Before spawn: a Ctrl event in the gap would kill the shim and
