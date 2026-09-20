@@ -1,29 +1,40 @@
 # Scoop-Shim Performance Benchmark
 
-Target: `C:\Windows\System32\whoami.exe` (built-in Windows executable)
-Tool: [hyperfine](https://github.com/sharkdp/hyperfine)
-Architecture: auto-detected (x64/x86/arm64)
-20 warmup + 50 measured runs per implementation (randomized order)
+- Target: `C:\Windows\System32\whoami.exe` (built-in Windows executable)
+- Tool: [hyperfine](https://github.com/sharkdp/hyperfine)
+- Architecture: auto-detected (x64/x86/arm64)
+
+Candidates are interleaved in randomized rounds and reported as pooled medians with the inter-quartile range. CPU time (user+system) is reported next to wall clock because wall clock is unreliable on a busy machine.
+
+Before timing, each shim is run once untimed as a canary; a candidate that exits nonzero is dropped from the run (with a warning) so a broken build cannot be reported as the fastest.
 
 ## Usage
 
 ```powershell
 .\benchmark.ps1
+.\benchmark.ps1 -Rounds 20 -Runs 25 -Warmup 5
 ```
 
-Template `.shim` file at `shims/template.shim` — edit to change benchmark target.
+Defaults: `-Rounds 10`, `-Runs 15`, `-Warmup 5`, `-Arch auto` (x86/x64/arm64); `-UseShell` forces the system shell, which is also used when a path contains spaces.
+
+Edit `shims/template.shim` to change the benchmark target.
 
 ## Results
 
-| Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
-|:---|---:|---:|---:|---:|
-| `direct` | 16.5 ± 3.7 | 10.3 | 25.2 | 1.00 |
-| `C#` | 26.1 ± 3.5 | 20.4 | 36.1 | 1.58 ± 0.41 |
-| `Zig` | 77.4 ± 3.3 | 71.6 | 88.8 | 4.70 ± 1.07 |
-| `Rust` | 78.2 ± 6.8 | 68.8 | 108.0 | 4.75 ± 1.15 |
-| `C++` | 80.5 ± 12.1 | 69.5 | 134.9 | 4.89 ± 1.32 |
+x64, 10 rounds x 15 runs:
+
+| Implementation | Wall [ms] | Wall IQR | CPU [ms] | CPU IQR | CPU overhead [ms] |
+| -------------- | --------: | -------: | -------: | ------: | ----------------: |
+| `direct`       |      40.2 |      6.8 |     31.2 |     6.3 |                 - |
+| `C++`          |      77.0 |     10.9 |     64.6 |    12.5 |             +33.4 |
+| `Zig`          |      75.5 |     10.4 |     65.6 |     6.3 |             +34.4 |
+| `Rust`         |      74.8 |      9.8 |     67.7 |    13.5 |             +36.5 |
+| `C#`           |     119.2 |     12.8 |    117.7 |     6.2 |             +86.5 |
+
+The native shims are within each other's inter-quartile ranges and cannot be ranked by this benchmark. C# pays .NET Framework runtime startup on every launch.
 
 ## Files
 
-- `shims/template.shim` — .shim content template (edit to change target)
-- `benchmark.ps1` — benchmark runner
+- `benchmark.ps1` - benchmark runner
+- `shims/template.shim` - .shim content template
+- `results.md` / `results.json` - last run, regenerated on every run (not tracked)

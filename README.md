@@ -80,17 +80,17 @@ All implementations share the same `.shim` format.
 
 ## Startup Latency
 
-Benchmarked with `C:\Windows\System32\whoami.exe` (built-in) via [hyperfine](https://github.com/sharkdp/hyperfine) — 20 warmup + 50 measured runs per implementation (randomized order). Architecture: x64.
+[hyperfine](https://github.com/sharkdp/hyperfine) against `C:\Windows\System32\whoami.exe`, x64: 10 interleaved rounds x 15 runs, no shell. Values are medians over all samples; CPU time (user+system) is reported because wall clock is unreliable on a busy machine.
 
-| Implementation |    Mean [ms] |    vs Direct | Extra [ms] |
-| -------------- | -----------: | -----------: | ---------: |
-| direct         |  89.9 ± 39.7 |         1.00 |          — |
-| C#             | 113.8 ± 11.4 | 1.27× ± 0.57 |      +23.9 |
-| C++            | 176.1 ± 33.7 | 1.96× ± 0.94 |      +86.2 |
-| Zig            | 178.6 ± 32.9 | 1.99× ± 0.95 |      +88.7 |
-| Rust           | 193.0 ± 24.0 | 2.15× ± 0.99 |     +103.2 |
+| Implementation | Wall [ms] | CPU [ms] | Overhead [ms] |
+| -------------- | --------: | -------: | ------------: |
+| direct         |      40.2 |     31.2 |             - |
+| C++            |      77.0 |     64.6 |         +33.4 |
+| Zig            |      75.5 |     65.6 |         +34.4 |
+| Rust           |      74.8 |     67.7 |         +36.5 |
+| C#             |     119.2 |    117.7 |         +86.5 |
 
-All shims share the same `.shim` format overhead; variance is dominated by process creation and file I/O. C# benefits from the CLR already being warm in typical Scoop sessions.
+The native shims are statistically indistinguishable (their inter-quartile ranges overlap). C# pays .NET Framework runtime startup on every launch.
 
 ## Development
 
