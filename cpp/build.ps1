@@ -8,7 +8,7 @@
 .PARAMETER Configuration
     Build configuration: Debug, Release. Default: Release.
 .PARAMETER Tool
-    Build tool: Zig, MSBuild, or Auto (try MSBuild first). Default: Auto.
+    Build tool: Zig or MSBuild. Default: Zig.
 #>
 param(
   [ValidateSet('x86', 'x64', 'arm64')]

@@ -151,14 +151,9 @@ inline void WriteErrorSys(DWORD err)
 [[nodiscard]] bool IsGuiSubsystem() noexcept;
 
 // GUI/redirected launches can yield null or INVALID_HANDLE_VALUE std handles.
-// A GUI shim may have detached from (or never had) a console; reattach so CONIN$/CONOUT$ open.
+// Console policy lives in wmain; a detached GUI shim has no console, so the opens below fail.
 inline void EnsureStandardHandles(STARTUPINFOW& si) noexcept
 {
-    if (IsGuiSubsystem())
-    {
-        AttachConsole(ATTACH_PARENT_PROCESS); // ignore failure - parent may have no console
-    }
-
     // SECURITY_ATTRIBUTES.bInheritHandle=TRUE lets the child inherit (CreateProcessW bInheritHandles=TRUE).
     SECURITY_ATTRIBUTES sa {sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
 
@@ -217,28 +212,38 @@ inline void ReportShimFileError(const wchar_t* action, const wchar_t* file, DWOR
     return sv;
 }
 
+[[nodiscard]] bool IEquals(std::wstring_view a, std::wstring_view b) noexcept
+{
+    return a.size() == b.size() && CompareStringOrdinal(a.data(), static_cast<int>(a.size()), b.data(), static_cast<int>(b.size()), TRUE) == CSTR_EQUAL;
+}
+
+[[nodiscard]] size_t IFind(std::wstring_view hay, std::wstring_view needle, size_t from) noexcept
+{
+    if (needle.empty() || from >= hay.size())
+        return std::wstring_view::npos;
+
+    const int idx =
+        FindStringOrdinal(FIND_FROMSTART, hay.data() + from, static_cast<int>(hay.size() - from), needle.data(), static_cast<int>(needle.size()), TRUE);
+    return idx < 0 ? std::wstring_view::npos : from + static_cast<size_t>(idx);
+}
+
 void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
 {
-    if (auto pos = args.find(c_dirPlaceholder); pos != std::wstring::npos) [[unlikely]]
+    auto pos = IFind(args, c_dirPlaceholder, 0);
+    if (pos == std::wstring::npos) [[likely]]
+        return;
+
+    // %~dp0 in batch always includes trailing backslash
+    std::wstring replacement(curDir);
+    if (replacement.empty() || (replacement.back() != L'\\' && replacement.back() != L'/'))
     {
-        // %~dp0 in batch always includes trailing backslash
-        std::wstring replacement(curDir);
-        if (replacement.empty() || (replacement.back() != L'\\' && replacement.back() != L'/'))
-        {
-            replacement += L'\\';
-        }
+        replacement += L'\\';
+    }
 
-        // Reserve for N expansions: value.size() + n * (targetDir.size() + 1) worst case.
-        size_t n = 0;
-        for (size_t p = pos; p != std::wstring::npos; p = args.find(c_dirPlaceholder, p + c_dirPlaceholder.size()))
-            ++n;
-        args.reserve(args.size() + n * (replacement.size() - c_dirPlaceholder.size()));
-
-        do
-        {
-            args.replace(pos, c_dirPlaceholder.size(), replacement);
-            pos = args.find(c_dirPlaceholder, pos + replacement.size());
-        } while (pos != std::wstring::npos);
+    while (pos != std::wstring::npos)
+    {
+        args.replace(pos, c_dirPlaceholder.size(), replacement);
+        pos = IFind(args, c_dirPlaceholder, pos + replacement.size());
     }
 }
 
@@ -305,29 +310,21 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
     return result;
 }
 
-[[nodiscard]] std::wstring BuildCommandLine(const std::wstring& exePath, const std::vector<std::wstring>& args)
+[[nodiscard]] std::wstring JoinQuoted(const std::vector<std::wstring>& parts, const std::wstring_view prefix)
 {
-    std::wstring cmd = QuoteArg(exePath);
-    for (const auto& arg : args)
+    std::wstring out(prefix);
+    for (size_t i = 0; i < parts.size(); ++i)
     {
-        cmd += L' ';
-        cmd += QuoteArg(arg);
+        if (i > 0 || !prefix.empty())
+            out += L' ';
+        out += QuoteArg(parts[i]);
     }
-    return cmd;
+    return out;
 }
 
-// No exe prefix - ShellExecuteExW takes parameters separately from the file.
-[[nodiscard]] std::wstring BuildParams(const std::vector<std::wstring>& args)
-{
-    std::wstring params;
-    for (size_t i = 0; i < args.size(); ++i)
-    {
-        if (i > 0)
-            params += L' ';
-        params += QuoteArg(args[i]);
-    }
-    return params;
-}
+[[nodiscard]] std::wstring BuildCommandLine(const std::wstring& exePath, const std::vector<std::wstring>& args) { return JoinQuoted(args, QuoteArg(exePath)); }
+
+[[nodiscard]] std::wstring BuildParams(const std::vector<std::wstring>& args) { return JoinQuoted(args, {}); }
 
 [[nodiscard]] bool IsGuiSubsystem() noexcept
 {
@@ -352,12 +349,7 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
     return ntHeaders->OptionalHeader.Subsystem == IMAGE_SUBSYSTEM_WINDOWS_GUI;
 }
 
-[[nodiscard]] bool ParseBool(std::wstring_view value) noexcept
-{
-    // _wcsnicmp compares exactly N chars - safe on non-null-terminated views
-    return (value.size() == 4 && _wcsnicmp(value.data(), L"true", 4) == 0) || (value.size() == 1 && value[0] == L'1') ||
-           (value.size() == 3 && _wcsnicmp(value.data(), L"yes", 3) == 0);
-}
+[[nodiscard]] bool ParseBool(std::wstring_view value) noexcept { return IEquals(value, L"true"sv) || IEquals(value, L"yes"sv) || value == L"1"sv; }
 
 // ExpandEnvironmentStringsW requires null-terminated input; unknown %VAR% stays as-is.
 [[nodiscard]] std::wstring ExpandEnvVars(std::wstring_view input)
@@ -482,8 +474,9 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
 
 [[nodiscard]] ShimInfo GetShimInfo()
 {
-    std::array<wchar_t, MAX_PATH + 2> filename {};
-    const auto filenameSize = GetModuleFileNameW(nullptr, filename.data(), MAX_PATH);
+    std::vector<wchar_t> filename(MAX_PATH + 2);
+    DWORD capacity = static_cast<DWORD>(filename.size());
+    DWORD filenameSize = GetModuleFileNameW(nullptr, filename.data(), capacity);
 
     if (filenameSize == 0) [[unlikely]]
     {
@@ -492,7 +485,26 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
         return {};
     }
 
-    if (filenameSize >= MAX_PATH) [[unlikely]]
+    // Truncation returns the required size: grow and retry, capped at the path limit.
+    constexpr DWORD maxModulePath = 32768;
+    while (filenameSize >= capacity && capacity < maxModulePath) [[unlikely]]
+    {
+        DWORD want = capacity * 4;
+        if (want > maxModulePath)
+            want = maxModulePath;
+        // Room for the ".exe" -> "shim" overwrite plus its null terminator.
+        filename.resize(want + 2);
+        capacity = want;
+        filenameSize = GetModuleFileNameW(nullptr, filename.data(), capacity);
+        if (filenameSize == 0) [[unlikely]]
+        {
+            WriteErrorW(L"Shim: The filename of the program could not be determined");
+            WriteErrorSys(GetLastError());
+            return {};
+        }
+    }
+
+    if (filenameSize >= capacity) [[unlikely]]
     {
         std::wstring msg = L"Shim: The filename of the program is too long to handle: '";
         msg += std::wstring_view(filename.data(), filenameSize);
@@ -518,10 +530,19 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
     const DWORD fileSize = GetFileSize(shimFile.get(), nullptr);
     std::vector<char> raw(fileSize == INVALID_FILE_SIZE ? 0 : fileSize);
     DWORD bytesRead = 0;
-    if (fileSize == INVALID_FILE_SIZE || (fileSize > 0 && (!ReadFile(shimFile.get(), raw.data(), fileSize, &bytesRead, nullptr) || bytesRead != fileSize)))
-        [[unlikely]]
+    bool readOk = (fileSize != INVALID_FILE_SIZE);
+    DWORD readErr = ERROR_READ_FAULT;
+    if (readOk && fileSize > 0)
     {
-        ReportShimFileError(L"Cannot read shim file", filename.data(), GetLastError());
+        readOk = ReadFile(shimFile.get(), raw.data(), fileSize, &bytesRead, nullptr) != FALSE;
+        readErr = readOk ? ERROR_READ_FAULT : GetLastError();
+        // Short read: the file shrank between GetFileSize and ReadFile, so GetLastError() is 0.
+        if (readOk && bytesRead != fileSize)
+            readOk = false;
+    }
+    if (!readOk) [[unlikely]]
+    {
+        ReportShimFileError(L"Cannot read shim file", filename.data(), readErr);
         return {};
     }
 
@@ -559,7 +580,7 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
     {
         auto line = TrimTrailingWhitespace(rawLine);
         auto parsed = ParseShimLine(line);
-        if (!parsed || parsed->first != c_pathPrefix)
+        if (!parsed || !IEquals(parsed->first, c_pathPrefix))
             continue;
 
         std::wstring pathVal(parsed->second);
@@ -580,7 +601,7 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
 
         const auto& [name, value] = *parsed;
 
-        if (name == c_pathPrefix)
+        if (IEquals(name, c_pathPrefix))
         {
             if (!info.path) // first path line wins
             {
@@ -589,7 +610,7 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
                 info.path = ExpandAndUnquote(pathVal);
             }
         }
-        else if (name == c_argsPrefix)
+        else if (IEquals(name, c_argsPrefix))
         {
             std::wstring argsStr(value);
             NormalizeArgsInPlace(argsStr, targetDir);
@@ -608,13 +629,13 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
                 }
             }
         }
-        else if (name == c_cwdPrefix || name == c_workdirPrefix)
+        else if (IEquals(name, c_cwdPrefix) || IEquals(name, c_workdirPrefix))
         {
             std::wstring cwdVal(value);
             NormalizeArgsInPlace(cwdVal, targetDir);
             info.cwd = ExpandAndUnquote(cwdVal);
         }
-        else if (name == c_elevatePrefix || name == c_runasPrefix)
+        else if (IEquals(name, c_elevatePrefix) || IEquals(name, c_runasPrefix))
         {
             info.elevate = ParseBool(value);
         }
@@ -714,7 +735,17 @@ void NormalizeArgsInPlace(std::wstring& args, std::wstring_view curDir)
         if (jobHandle)
             AssignProcessToJobObject(jobHandle, pi.hProcess);
 
-        ResumeThread(result.thread.get());
+        // A failed resume leaves the child suspended while the shim waits on it forever.
+        if (ResumeThread(result.thread.get()) == static_cast<DWORD>(-1)) [[unlikely]]
+        {
+            const DWORD resumeErr = GetLastError();
+            WriteErrorW(L"Shim: Could not resume suspended process");
+            WriteErrorSys(resumeErr);
+            if (jobHandle)
+                TerminateJobObject(jobHandle, 1);
+            result.thread.reset();
+            result.process.reset();
+        }
     }
     else
     {
@@ -796,7 +827,12 @@ int wmain(int argc, wchar_t* argv[])
     WaitForSingleObject(processHandle.get(), INFINITE);
 
     DWORD exitCode = 1;
-    GetExitCodeProcess(processHandle.get(), &exitCode);
+    if (!GetExitCodeProcess(processHandle.get(), &exitCode)) [[unlikely]]
+    {
+        WriteErrorW(L"Shim: Could not get child exit code");
+        WriteErrorSys(GetLastError());
+        exitCode = 1; // explicit: a failed query must not yield 0 (success)
+    }
 
     return static_cast<int>(exitCode);
 }
