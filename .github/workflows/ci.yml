@@ -60,21 +60,18 @@ jobs:
         if (-not $filtered) { $filtered = @() }
         echo "value=$($filtered | ConvertTo-Json -Compress -AsArray)" >> $env:GITHUB_OUTPUT
 
-  format:
-    needs: detect
-    if: needs.detect.outputs.matrix != '' && needs.detect.outputs.matrix != '[]'
-    strategy:
-      fail-fast: false
-      matrix:
-        include: ${{ fromJSON(needs.detect.outputs.matrix) }}
-    runs-on: windows-latest
+  # Always runs: docs-only PRs produce an empty lane matrix.
+  hygiene:
+    runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v7
     - name: Check whitespace hygiene
       shell: pwsh
       run: |
+        $binaryExts = @('.exe', '.dll', '.png', '.ico', '.zip', '.sha256', '.sha512')
         $bad = @()
         foreach ($f in git ls-files) {
+          if ($binaryExts -contains [System.IO.Path]::GetExtension($f).ToLowerInvariant()) { continue }
           $b = [System.IO.File]::ReadAllBytes((Join-Path $PWD $f))
           if ($b.Length -eq 0) { continue }
           if ($b[-1] -ne 0x0A) { $bad += "$f (no final newline)"; continue }
@@ -90,6 +87,30 @@ jobs:
         }
         if ($bad) { throw "Whitespace issues: $($bad -join '; ')" }
         Write-Host "All tracked files pass whitespace checks."
+
+    - name: Check encoding hygiene
+      shell: pwsh
+      run: |
+        $binaryExts = @('.exe', '.dll', '.png', '.ico', '.zip', '.sha256', '.sha512')
+        $bad = @()
+        foreach ($f in git ls-files) {
+          if ($binaryExts -contains [System.IO.Path]::GetExtension($f).ToLowerInvariant()) { continue }
+          $b = [System.IO.File]::ReadAllBytes((Join-Path $PWD $f))
+          if ($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF) { $bad += "$f (UTF-8 BOM)" }
+        }
+        if ($bad) { throw "Encoding issues: $($bad -join '; ')" }
+        Write-Host "All tracked files pass encoding checks."
+
+  format:
+    needs: detect
+    if: needs.detect.outputs.matrix != '' && needs.detect.outputs.matrix != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.detect.outputs.matrix) }}
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v7
     - name: Setup .NET
       if: matrix.setup == 'dotnet'
       uses: actions/setup-dotnet@v6
@@ -112,8 +133,6 @@ jobs:
         }
 
   build:
-    permissions:
-      contents: write
     needs: detect
     if: needs.detect.outputs.matrix != '' && needs.detect.outputs.matrix != '[]'
     strategy:
@@ -147,9 +166,7 @@ jobs:
     - name: Test ${{ matrix.component }} (x64)
       shell: pwsh
       run: .\test\run-tests.ps1 -ShimExe ".\${{ matrix.component }}\bin\x64\shim.exe"
-
-    # Release steps (tag push only)
-    - name: Package ${{ matrix.component }}
+    - name: Stage release packages
       if: github.ref_type == 'tag'
       shell: pwsh
       run: |
@@ -169,22 +186,56 @@ jobs:
           "$sha512  shim.exe" | Out-File "$tmp\shim.exe.sha512" -Encoding ascii
           Compress-Archive -Path "$tmp\*" -DestinationPath "$dist\shim-$t.zip" -Force
         }
-    - name: Resolve fromTag
+    - name: Upload release artifacts
       if: github.ref_type == 'tag'
+      uses: actions/upload-artifact@v5
+      with:
+        name: release-${{ matrix.component }}
+        path: ${{ matrix.component }}/dist/*.zip
+        if-no-files-found: error
+
+  # Tag-gated release: the only job that needs an elevated token.
+  release:
+    needs: [detect, build]
+    if: github.ref_type == 'tag' && needs.detect.outputs.matrix != '' && needs.detect.outputs.matrix != '[]'
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.detect.outputs.matrix) }}
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        fetch-tags: true
+    - name: Preflight VT_API_KEY
+      shell: pwsh
+      env:
+        VT_API_KEY: ${{ secrets.VT_API_KEY }}
+      run: |
+        if (-not $env:VT_API_KEY) {
+          throw "Missing required secret VT_API_KEY; set it in repository secrets before tagging a release."
+        }
+    - uses: actions/download-artifact@v5
+      with:
+        name: release-${{ matrix.component }}
+        path: ${{ matrix.component }}/dist
+    - name: Resolve fromTag
       id: fromtag
       shell: pwsh
       run: |
         $tags = git tag --list "${{ matrix.component }}/v*" | ForEach-Object { $_ -replace '^[^/]+/v', '' } | Where-Object { $_ -match '^\d+\.\d+\.\d+$' }
         $ver = "${{ matrix.version }}"
-        $sorted = $tags | Sort-Object { [version]$_ }
+        $sorted = @($tags | Sort-Object { [version]$_ })
         $i = [array]::IndexOf($sorted, $ver)
-        if ($i -gt 0) {
-          $prev = "${{ matrix.component }}/v$($sorted[$i-1])"
-          echo "tag=$prev" >> $env:GITHUB_OUTPUT
+        if ($i -lt 1) {
+          throw "Cannot resolve previous release tag for ${{ matrix.component }} v$ver (known release tags: $($sorted -join ', '))"
         }
+        $prev = "${{ matrix.component }}/v$($sorted[$i-1])"
+        echo "tag=$prev" >> $env:GITHUB_OUTPUT
     - name: Build Changelog
       id: changelog
-      if: github.ref_type == 'tag'
       uses: mikepenz/release-changelog-builder-action@v6
       with:
         mode: "HYBRID"
@@ -222,7 +273,6 @@ jobs:
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     - name: Release
-      if: github.ref_type == 'tag'
       id: release
       uses: softprops/action-gh-release@v3
       with:
@@ -231,7 +281,6 @@ jobs:
         body: ${{ steps.changelog.outputs.changelog }}
         fail_on_unmatched_files: true
     - name: VirusTotal Scan
-      if: github.ref_type == 'tag'
       uses: cssnr/virustotal-action@v2
       with:
         vt_api_key: ${{ secrets.VT_API_KEY }}
