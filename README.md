@@ -34,7 +34,7 @@ Values may be wrapped in double quotes (e.g. `path = "C:\Program Files\app.exe"`
 
 ### Variable Expansion
 
-- `%ENV%` — Expands environment variables in `path`, `args`, `cwd`, and environment override values. Unknown variables (e.g. `%NONEXISTENT_VAR%`) are preserved as-is.
+- `%ENV%` — Expands environment variables in `path`, `cwd`, and environment override values; in `args` the value is passed through unchanged so the child process can expand `%VAR%` itself. Unknown variables (e.g. `%NONEXISTENT_VAR%`) are preserved as-is.
 - `%~dp0` — In `path`, expands against the **shim's own directory** (the target is unknown at that point). In `args`, `cwd`, and environment override values, expands to the **directory containing the target executable** with a trailing backslash. All occurrences in a value are replaced. Duplicate `path` keys: the first one wins.
 
 ### Argument Parsing

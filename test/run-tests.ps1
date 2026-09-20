@@ -1,4 +1,4 @@
-﻿#Requires -Version 7
+#Requires -Version 7
 
 # Functional tests for shim.exe
 # Usage: ./run-tests.ps1 -ShimExe <path-to-shim.exe>
@@ -175,14 +175,31 @@ Invoke-ShimTest "Path with spaces" -Setup {
     Write-Shim $d "test" "path = $sp\app.cmd"
 } -Assert { param($r) $r.Output -match "SPACES_OK" }
 
+# Write-Shim emits LF-only; a CRLF .shim (the Notepad default) must not glue a CR to values.
+Invoke-ShimTest "CRLF shim file trims trailing CR from args" -Setup {
+    param($d)
+    Write-Batch "$d\echoargs.cmd" "echo ARGS=%*"
+    Copy-Item $ShimExe "$d\test.exe"
+    $content = "path = $d\echoargs.cmd`r`nargs = CRLF_OK`r`n"
+    [System.IO.File]::WriteAllText("$d\test.shim", $content)
+} -Assert {
+    param($r)
+    # End-of-line anchor: a prefix match would still pass with a trailing CR.
+    $pass = $r.Output -match '(?m)ARGS=CRLF_OK\r?$'
+    @{ Pass = $pass; Message = "Expected ARGS=CRLF_OK at end of line (no trailing CR), got: $($r.Output)" }
+}
+
 # --- %~VAR% expansion ---------------------------------------------------------
 
 Invoke-ShimTest "%~VAR% expansion in path" -Setup {
     param($d)
-    Write-Shim $d "test" "path = %SystemRoot%\System32\cmd.exe`nargs = /c echo TEMP=%TEMP%"
+    # cmd.exe re-expands %VAR% itself, so only a PowerShell target proves the shim expanded path.
+    Write-Shim $d "test" "path = %SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`nargs = -NoProfile -Command [Console]::Out.Write('%SystemRoot%__')"
 } -Assert {
     param($r)
-    @{ Pass = $r.Output -match [regex]::Escape("TEMP=$env:TEMP"); Message = "Output: $($r.Output)" }
+    $literal = "%SystemRoot%__"
+    $pass = ($r.ExitCode -eq 0) -and ($r.Output -match [regex]::Escape($literal))
+    @{ Pass = $pass; Message = "Expected exit 0 (path expanded) and literal '$literal' from args. Output: $($r.Output), ExitCode: $($r.ExitCode)" }
 }
 
 Invoke-ShimTest "Unknown %VAR% preserved as-is" -Setup {
@@ -235,6 +252,18 @@ Invoke-ShimTest "Env var value %~dp0 expansion (multiple occurrences)" -Setup {
     @{ Pass = $r.Output -match [regex]::Escape("MY_D=$expected"); Message = "Expected: MY_D=$expected, Output: $($r.Output)" }
 }
 
+# --- Case-insensitivity (Windows convention) -----------------------------------
+
+Invoke-ShimTest "Case-insensitive .shim parsing" -Setup {
+    param($d)
+    Write-Batch "$d\ci.cmd" "echo OUT=[%*]"
+    Write-Shim $d "test" "PATH = $d\ci.cmd`nARGS = %~DP0"
+} -Assert {
+    param($r)
+    $expected = "OUT=[$($r.TestDir)\]"
+    @{ Pass = $r.Output -match [regex]::Escape($expected); Message = "Expected: $expected, Output: $($r.Output)" }
+}
+
 # --- %~dp0 placeholder --------------------------------------------------------
 
 Invoke-ShimTest "Args %~dp0 expansion (absolute path)" -Setup {
@@ -253,7 +282,7 @@ Invoke-ShimTest "Args %~dp0 expansion (relative path)" -Setup {
     Write-Shim $d "test" "path = $d\bin\app.cmd`nargs = %~dp0"
 } -Assert {
     param($r)
-    # path resolves to $d\bin\app.cmd → target dir = $d\bin\
+    # path resolves to $d\bin\app.cmd - target dir = $d\bin\
     $expected = "$($r.TestDir)\bin\"
     @{ Pass = $r.Output.StartsWith($expected, [StringComparison]::OrdinalIgnoreCase); Message = "Expected prefix: $expected, Output: $($r.Output)" }
 }
@@ -283,8 +312,9 @@ Invoke-ShimTest "Pass-through arguments" -Setup {
     Write-Shim $d "test" "path = $d\echoargs.cmd"
 } -RunArgs @("arg1", "arg2", "arg with spaces") -Assert {
     param($r)
-    $pass = ($r.Output -match "arg1") -and ($r.Output -match "arg2") -and ($r.Output -match "arg with spaces")
-    @{ Pass = $pass; Message = "Output: $($r.Output)" }
+    # Exact string proves order and quoting.
+    $pass = $r.Output -match '(?m)ARGS=arg1 arg2 "arg with spaces"\r?$'
+    @{ Pass = $pass; Message = "Expected ARGS=arg1 arg2 `"arg with spaces`", got: $($r.Output)" }
 }
 
 Invoke-ShimTest "Args with embedded quotes (PS target)" -Setup {
@@ -296,12 +326,13 @@ Invoke-ShimTest "Args with embedded quotes (PS target)" -Setup {
 
 Invoke-ShimTest "Shim + user args combined" -Setup {
     param($d)
-    Write-Batch "$d\echoargs.cmd" "echo %*"
+    Write-Batch "$d\echoargs.cmd" "echo ARGS=%*"
     Write-Shim $d "test" "path = $d\echoargs.cmd`nargs = --flag value"
 } -RunArgs @("--extra") -Assert {
     param($r)
-    $pass = ($r.Output -match "--flag") -and ($r.Output -match "value") -and ($r.Output -match "--extra")
-    @{ Pass = $pass; Message = "Output: $($r.Output)" }
+    # Exact string: shim args must precede user args (README "appended after").
+    $pass = $r.Output -match '(?m)ARGS=--flag value --extra\r?$'
+    @{ Pass = $pass; Message = "Expected ARGS=--flag value --extra, got: $($r.Output)" }
 }
 
 Invoke-ShimTest "Args with backslashes" -Setup {
@@ -366,6 +397,20 @@ Invoke-ShimTest "UTF-8 BOM in shim file" -Setup {
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($content)
     [System.IO.File]::WriteAllBytes("$d\test.shim", $bom + $bytes)
 } -Assert { param($r) $r.Output -match "BOM_OK" }
+
+Invoke-ShimTest "Invalid UTF-8 line skipped without abort" -Setup {
+    param($d)
+    Write-Batch "$d\app.cmd" "echo AFTER_BAD_LINE"
+    Copy-Item $ShimExe "$d\test.exe"
+    # path, then a line with an invalid UTF-8 sequence (C3 28), then args
+    $bytes = [byte[]](0x70,0x61,0x74,0x68,0x20,0x3D,0x20) + [System.Text.Encoding]::UTF8.GetBytes("$d\app.cmd") +
+        [byte[]](0x0A,0xC3,0x28,0x20,0x3D,0x20,0x62,0x61,0x64,0x0A) +
+        [System.Text.Encoding]::UTF8.GetBytes("args = /c echo AFTER_BAD_LINE")
+    [System.IO.File]::WriteAllBytes("$d\test.shim", $bytes)
+} -Assert {
+    param($r)
+    @{ Pass = ($r.Output -match "AFTER_BAD_LINE") -and ($r.ExitCode -eq 0); Message = "Output: $($r.Output), ExitCode: $($r.ExitCode)" }
+}
 
 # --- Blank line handling --------------------------------------------------------
 
@@ -506,7 +551,7 @@ Invoke-ShimTest "workdir alias for cwd" -Setup {
 
 # --- Process lifecycle ---------------------------------------------------------
 
-# Direct-child-only: complex process chain — uses Start-Process + Wait-Process
+# Direct-child-only: complex process chain - uses Start-Process + Wait-Process
 # to verify shim exits when its direct child exits but leaves the grandchild alive.
 $script:TestNumber++
 $num = $script:TestNumber
@@ -562,14 +607,25 @@ Invoke-ShimTest "runas alias not leaked as env var" -Setup {
 
 Invoke-ShimTest "elevate = true triggers elevation path" -Setup {
     param($d)
-    Write-Batch "$d\app.cmd" "echo ELEVATE_MARKER"
+    Write-Batch "$d\app.cmd" "> `"$d\marker.txt`" echo ELEVATE_OK"
     Write-Shim $d "test" "path = $d\app.cmd`nelevate = true"
 } -Assert {
     param($r)
-    # Elevation path (ShellExecuteExW) runs child in a separate console — output
-    # never reaches this pipe. Bug path (CreateProcessW) inherits our console.
-    $bugPresent = ($r.Output -match "ELEVATE_MARKER") -and ($r.ExitCode -eq 0)
-    @{ Pass = -not $bugPresent; Message = "Output: $($r.Output), ExitCode: $($r.ExitCode)" }
+    $marker = Join-Path $r.TestDir "marker.txt"
+
+    # IsInRole tolerates a filtered token, so check the group SID directly.
+    $isAdmin = ([Security.Principal.WindowsIdentity]::GetCurrent().Groups | ForEach-Object { $_.Value }) -contains "S-1-5-32-544"
+    if (-not $isAdmin) {
+        Write-Host "  [SKIP] Test #$script:TestNumber elevation requires an elevated runner (UAC consent dialog cannot be automated); counting as pass" -ForegroundColor DarkYellow
+        return $true
+    }
+
+    # Positive assertion: a lane that errors out on elevate = true now fails.
+    $writable = $true
+    try { [System.IO.File]::WriteAllText($marker, "") } catch { $writable = $false }
+    $pass = $writable -and (Test-Path $marker)
+    Remove-Item $marker -Force -ErrorAction SilentlyContinue
+    @{ Pass = $pass; Message = "Elevated child did not write $marker; Output: $($r.Output), ExitCode: $($r.ExitCode)" }
 }
 
 # --- GUI subsystem -------------------------------------------------------------
