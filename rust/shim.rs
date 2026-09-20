@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: MIT
 // Scoop shim - Rust implementation
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::os::windows::ffi::OsStrExt;
 
 use windows_sys::core::BOOL;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, LocalFree, ERROR_INSUFFICIENT_BUFFER, GENERIC_READ, GENERIC_WRITE,
+    CloseHandle, GetLastError, LocalFree, GENERIC_ACCESS_RIGHTS, GENERIC_READ, GENERIC_WRITE,
     HANDLE,
 };
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
@@ -26,7 +26,7 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
 use windows_sys::Win32::System::Environment::{ExpandEnvironmentStringsW, SetEnvironmentVariableW};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
 };
 use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
@@ -59,7 +59,7 @@ const DIR_PLACEHOLDER: &str = "%~dp0";
 
 struct ShimInfo {
     path: Option<String>,
-    args: Vec<String>,
+    args: Vec<OsString>,
     cwd: Option<String>,
     env_vars: Vec<(String, String)>,
     elevate: bool,
@@ -163,8 +163,12 @@ fn to_wide(s: &str) -> Vec<u16> {
 // One GetModuleFileNameW call yields both the shim's directory and its paired .shim path.
 fn get_shim_paths() -> Option<(String, String)> {
     unsafe {
-        let mut buf = [0u16; 261];
-        let len = GetModuleFileNameW(GetModuleHandleW(std::ptr::null()), buf.as_mut_ptr(), 260);
+        let mut buf = [0u16; 2048];
+        let len = GetModuleFileNameW(
+            GetModuleHandleW(std::ptr::null()),
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+        );
         if len == 0 {
             write_error_ctx(
                 "The filename of the program could not be determined",
@@ -172,15 +176,15 @@ fn get_shim_paths() -> Option<(String, String)> {
             );
             return None;
         }
-        let full = String::from_utf16_lossy(&buf[..len as usize]);
-        if len >= 260 {
+        if len as usize >= buf.len() {
             write_error_wide(&to_wide(
                 "Shim: The filename of the program is too long to handle: '",
             ));
-            write_error_wide(&to_wide(&full));
+            write_error_wide(&to_wide(&String::from_utf16_lossy(&buf[..len as usize])));
             write_error_bytes(b"'.\n");
             return None;
         }
+        let full = String::from_utf16_lossy(&buf[..len as usize]);
         let dir = match full.rfind(['\\', '/']) {
             Some(pos) => full[..pos].to_string(),
             None => full.clone(),
@@ -238,60 +242,50 @@ fn expand_env_vars(input: &str) -> String {
     }
     let wide = to_wide_null(input);
     unsafe {
-        // Fast path: most values fit the stack buffer, so skip the sizing call + heap.
         let mut stack = [0u16; 512];
         let actual =
             ExpandEnvironmentStringsW(wide.as_ptr(), stack.as_mut_ptr(), stack.len() as u32);
-        if actual > 0 && actual as usize <= stack.len() {
+        // On overflow the API returns the REQUIRED size (larger than the buffer), not 0.
+        if actual == 0 {
+            return input.to_string();
+        }
+        if actual as usize <= stack.len() {
             return String::from_utf16_lossy(&stack[..actual as usize - 1]);
         }
-        if actual != 0 || GetLastError() != ERROR_INSUFFICIENT_BUFFER {
+
+        let mut buf = vec![0u16; actual as usize];
+        let written = ExpandEnvironmentStringsW(wide.as_ptr(), buf.as_mut_ptr(), actual);
+        if written == 0 || written > actual {
             return input.to_string();
         }
-
-        // Rare slow path: second call gets the required size, third expands.
-        let required = ExpandEnvironmentStringsW(wide.as_ptr(), std::ptr::null_mut(), 0);
-        if required == 0 {
-            return input.to_string();
-        }
-
-        let mut buf = vec![0u16; required as usize];
-        let actual = ExpandEnvironmentStringsW(wide.as_ptr(), buf.as_mut_ptr(), required);
-        if actual == 0 || actual > required {
-            return input.to_string();
-        }
-
-        String::from_utf16_lossy(&buf[..actual as usize - 1])
+        String::from_utf16_lossy(&buf[..written as usize - 1])
     }
 }
 
-fn dir_placeholder_count(s: &str) -> usize {
-    let mut n = 0;
-    let mut pos = 0;
-    while let Some(p) = s[pos..].find(DIR_PLACEHOLDER) {
-        n += 1;
-        pos += p + DIR_PLACEHOLDER.len();
+fn index_of_ignore_case(hay: &str, needle: &str, from: usize) -> Option<usize> {
+    let h = hay.as_bytes();
+    let n = needle.as_bytes();
+    if n.is_empty() {
+        return if from <= h.len() { Some(from) } else { None };
     }
-    n
+    if from >= h.len() || n.len() > h.len() - from {
+        return None;
+    }
+    h[from..]
+        .windows(n.len())
+        .position(|w| w.eq_ignore_ascii_case(n))
+        .map(|p| from + p)
 }
 
-// Replaces every %~dp0 occurrence (not just the first) with cur_dir plus a trailing
-// backslash, reserving up front so the string never reallocates.
 fn normalize_args_str(args: &mut String, cur_dir: &str) {
-    let n = dir_placeholder_count(args);
-    if n == 0 {
-        return;
-    }
     let mut replacement = cur_dir.to_string();
     if !replacement.ends_with('\\') && !replacement.ends_with('/') {
         replacement.push('\\');
     }
-    args.reserve(n * replacement.len().saturating_sub(DIR_PLACEHOLDER.len()));
     let mut pos = 0;
-    while let Some(p) = args[pos..].find(DIR_PLACEHOLDER) {
-        let start = pos + p;
-        args.replace_range(start..start + DIR_PLACEHOLDER.len(), &replacement);
-        pos = start + replacement.len();
+    while let Some(p) = index_of_ignore_case(args, DIR_PLACEHOLDER, pos) {
+        args.replace_range(p..p + DIR_PLACEHOLDER.len(), &replacement);
+        pos = p + replacement.len();
     }
 }
 
@@ -326,7 +320,7 @@ fn parse_shim_line(line: &str) -> Option<(&str, &str)> {
     Some((key, value))
 }
 
-fn parse_args_from_cmdline(cmdline: &str) -> Vec<String> {
+fn parse_args_from_cmdline(cmdline: &str) -> Vec<OsString> {
     if cmdline.is_empty() {
         return Vec::new();
     }
@@ -346,7 +340,7 @@ fn parse_args_from_cmdline(cmdline: &str) -> Vec<String> {
                     len += 1;
                 }
                 let slice = std::slice::from_raw_parts(ptr, len);
-                result.push(String::from_utf16_lossy(slice));
+                result.push(OsString::from(String::from_utf16_lossy(slice)));
             }
         }
         LocalFree(argv as *mut _);
@@ -366,9 +360,9 @@ fn resolve_against_base(path: &str, base_dir: &str) -> String {
         let to_resolve = if is_absolute {
             wide_path
         } else {
-            let mut combined: Vec<u16> = Vec::new();
-            combined.extend_from_slice(&wide_base[..wide_base.len() - 1]);
-            combined.push(b'\\' as u16);
+            let mut combined = wide_base;
+            combined.pop(); // drop the null
+            combined.push('\\' as u16);
             combined.extend_from_slice(&wide_path[..wide_path.len() - 1]);
             combined.push(0);
             combined
@@ -405,48 +399,51 @@ fn resolve_against_base(path: &str, base_dir: &str) -> String {
     }
 }
 
-// Windows CreateProcessW argument quoting rules.
-fn quote_arg(arg: &str) -> String {
-    if arg.is_empty() {
-        return "\"\"".to_string();
+// Windows CreateProcessW quoting rules, on raw UTF-16 units so unpaired surrogates survive.
+fn quote_arg(arg: &OsStr) -> Vec<u16> {
+    let units: Vec<u16> = arg.encode_wide().collect();
+    if units.is_empty() {
+        return vec![b'"' as u16, b'"' as u16];
     }
 
-    let needs_quoting = arg.bytes().any(|c| c == b' ' || c == b'\t' || c == b'"');
+    let needs_quoting = units
+        .iter()
+        .any(|&c| c == b' ' as u16 || c == b'\t' as u16 || c == b'"' as u16);
     if !needs_quoting {
-        return arg.to_string();
+        return units;
     }
 
-    let mut result = String::with_capacity(arg.len() + 8);
-    result.push('"');
+    let mut result: Vec<u16> = Vec::with_capacity(units.len() + 8);
+    result.push(b'"' as u16);
 
     let mut i = 0;
-    while i < arg.len() {
-        let ch = arg[i..].chars().next().unwrap();
-        if ch == '\\' {
+    while i < units.len() {
+        if units[i] == b'\\' as u16 {
             let bs_start = i;
-            while i < arg.len() && arg.as_bytes()[i] == b'\\' {
+            while i < units.len() && units[i] == b'\\' as u16 {
                 i += 1;
             }
             let count = i - bs_start;
-            if i == arg.len() {
-                result.extend(std::iter::repeat('\\').take(count * 2));
-            } else if arg.as_bytes()[i] == b'"' {
-                result.extend(std::iter::repeat('\\').take(count * 2 + 1));
-                result.push('"');
+            if i == units.len() {
+                result.extend(std::iter::repeat(b'\\' as u16).take(count * 2));
+            } else if units[i] == b'"' as u16 {
+                result.extend(std::iter::repeat(b'\\' as u16).take(count * 2 + 1));
+                result.push(b'"' as u16);
                 i += 1;
             } else {
-                result.extend(std::iter::repeat('\\').take(count));
+                result.extend(std::iter::repeat(b'\\' as u16).take(count));
             }
-        } else if ch == '"' {
-            result.push_str("\\\"");
+        } else if units[i] == b'"' as u16 {
+            result.push(b'\\' as u16);
+            result.push(b'"' as u16);
             i += 1;
         } else {
-            result.push(ch);
-            i += ch.len_utf8();
+            result.push(units[i]);
+            i += 1;
         }
     }
 
-    result.push('"');
+    result.push(b'"' as u16);
     result
 }
 
@@ -468,56 +465,38 @@ unsafe fn ensure_standard_handles(si: &mut STARTUPINFOW) {
     let conout = to_wide_null("CONOUT$");
     let mut replaced = false;
 
-    if si.hStdInput == NULL_HANDLE || si.hStdInput == INVALID_HANDLE {
-        let h: HANDLE = CreateFileW(
+    let slots: [(
+        &mut HANDLE,
+        *const u16,
+        GENERIC_ACCESS_RIGHTS,
+        FILE_SHARE_MODE,
+    ); 3] = [
+        (
+            &mut si.hStdInput,
             conin.as_ptr(),
             GENERIC_READ,
             FILE_SHARE_READ,
-            &sa,
-            OPEN_EXISTING,
-            0,
-            NULL_HANDLE,
-        );
-        if h == INVALID_HANDLE {
-            si.hStdInput = NULL_HANDLE;
-        } else {
-            si.hStdInput = h;
-            replaced = true;
-        }
-    }
-
-    if si.hStdOutput == NULL_HANDLE || si.hStdOutput == INVALID_HANDLE {
-        let h: HANDLE = CreateFileW(
+        ),
+        (
+            &mut si.hStdOutput,
             conout.as_ptr(),
             GENERIC_WRITE,
             FILE_SHARE_WRITE,
-            &sa,
-            OPEN_EXISTING,
-            0,
-            NULL_HANDLE,
-        );
-        if h == INVALID_HANDLE {
-            si.hStdOutput = NULL_HANDLE;
-        } else {
-            si.hStdOutput = h;
-            replaced = true;
-        }
-    }
-
-    if si.hStdError == NULL_HANDLE || si.hStdError == INVALID_HANDLE {
-        let h: HANDLE = CreateFileW(
+        ),
+        (
+            &mut si.hStdError,
             conout.as_ptr(),
             GENERIC_WRITE,
             FILE_SHARE_WRITE,
-            &sa,
-            OPEN_EXISTING,
-            0,
-            NULL_HANDLE,
-        );
-        if h == INVALID_HANDLE {
-            si.hStdError = NULL_HANDLE;
-        } else {
-            si.hStdError = h;
+        ),
+    ];
+    for (slot, name, access, share) in slots {
+        if *slot != NULL_HANDLE && *slot != INVALID_HANDLE {
+            continue;
+        }
+        let h: HANDLE = CreateFileW(name, access, share, &sa, OPEN_EXISTING, 0, NULL_HANDLE);
+        *slot = if h == INVALID_HANDLE { NULL_HANDLE } else { h };
+        if *slot != NULL_HANDLE {
             replaced = true;
         }
     }
@@ -553,7 +532,17 @@ fn parse_shim_info(cur_dir: &str, shim_path: &str) -> ShimInfo {
 
     let reader = BufReader::new(file);
 
-    let mut all_lines: Vec<String> = reader.lines().filter_map(|l| l.ok()).collect();
+    let mut all_lines: Vec<String> = reader
+        .lines()
+        .filter_map(|l| match l {
+            Ok(line) => Some(line),
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                unsafe { write_error_bytes(b"Shim: invalid UTF-8 line in shim file\n") };
+                None
+            }
+            Err(_) => None,
+        })
+        .collect();
     if let Some(first) = all_lines.first_mut() {
         if first.starts_with('\u{feff}') {
             first.remove(0);
@@ -566,7 +555,7 @@ fn parse_shim_info(cur_dir: &str, shim_path: &str) -> ShimInfo {
     let mut target_dir = cur_dir.to_string();
     for line in &all_lines {
         if let Some((key, value)) = parse_shim_line(line) {
-            if key != "path" {
+            if !key.eq_ignore_ascii_case("path") {
                 continue;
             }
             let mut path_val = value.to_string();
@@ -582,36 +571,30 @@ fn parse_shim_info(cur_dir: &str, shim_path: &str) -> ShimInfo {
             continue;
         };
 
-        match key {
-            "path" => {
-                if info.path.is_none() {
-                    // First path line wins; expand %~dp0 against the shim's own dir.
-                    let mut path_val = value.to_string();
-                    normalize_args_str(&mut path_val, cur_dir);
-                    info.path = Some(expand_and_strip_quotes(&path_val));
-                }
+        if key.eq_ignore_ascii_case("path") {
+            if info.path.is_none() {
+                // First path line wins; expand %~dp0 against the shim's own dir.
+                let mut path_val = value.to_string();
+                normalize_args_str(&mut path_val, cur_dir);
+                info.path = Some(expand_and_strip_quotes(&path_val));
             }
-            "args" => {
-                let mut args_str = value.to_string();
-                normalize_args_str(&mut args_str, &target_dir);
-                if !args_str.is_empty() {
-                    info.args = parse_args_from_cmdline(&args_str);
-                }
+        } else if key.eq_ignore_ascii_case("args") {
+            let mut args_str = value.to_string();
+            normalize_args_str(&mut args_str, &target_dir);
+            if !args_str.is_empty() {
+                info.args = parse_args_from_cmdline(&args_str);
             }
-            "cwd" | "workdir" => {
-                let mut cwd_str = value.to_string();
-                normalize_args_str(&mut cwd_str, &target_dir);
-                info.cwd = Some(expand_and_strip_quotes(&cwd_str));
-            }
-            "elevate" | "runas" => {
-                info.elevate = parse_bool(value);
-            }
-            _ => {
-                let mut env_val = value.to_string();
-                normalize_args_str(&mut env_val, &target_dir);
-                info.env_vars
-                    .push((key.to_string(), expand_and_strip_quotes(&env_val)));
-            }
+        } else if key.eq_ignore_ascii_case("cwd") || key.eq_ignore_ascii_case("workdir") {
+            let mut cwd_str = value.to_string();
+            normalize_args_str(&mut cwd_str, &target_dir);
+            info.cwd = Some(expand_and_strip_quotes(&cwd_str));
+        } else if key.eq_ignore_ascii_case("elevate") || key.eq_ignore_ascii_case("runas") {
+            info.elevate = parse_bool(value);
+        } else {
+            let mut env_val = value.to_string();
+            normalize_args_str(&mut env_val, &target_dir);
+            info.env_vars
+                .push((key.to_string(), expand_and_strip_quotes(&env_val)));
         }
     }
 
@@ -631,15 +614,16 @@ fn parse_shim_info(cur_dir: &str, shim_path: &str) -> ShimInfo {
 }
 
 // Quoted, space-joined argument string for ShellExecuteExW. Only elevation builds it.
-fn build_params(args: &[String]) -> Vec<u16> {
-    let mut p = String::new();
+fn build_params(args: &[OsString]) -> Vec<u16> {
+    let mut p: Vec<u16> = Vec::new();
     for (i, arg) in args.iter().enumerate() {
         if i > 0 {
-            p.push(' ');
+            p.push(b' ' as u16);
         }
-        p.push_str(&quote_arg(arg));
+        p.extend_from_slice(&quote_arg(arg));
     }
-    to_wide_null(&p)
+    p.push(0);
+    p
 }
 
 unsafe fn launch_elevated(
@@ -680,13 +664,18 @@ unsafe fn launch_elevated(
 
     let proc_handle: HANDLE = sei.hProcess;
     if job_handle != NULL_HANDLE && proc_handle != NULL_HANDLE {
-        AssignProcessToJobObject(job_handle, proc_handle);
+        if AssignProcessToJobObject(job_handle, proc_handle) == 0 {
+            write_error_ctx(
+                "Warning: could not assign process to job object",
+                GetLastError(),
+            );
+        }
     }
 
     (proc_handle, NULL_HANDLE)
 }
 
-unsafe fn make_process(info: &ShimInfo, job_handle: HANDLE) -> (HANDLE, HANDLE) {
+fn make_process(info: &ShimInfo, job_handle: HANDLE) -> (HANDLE, HANDLE) {
     let path = match &info.path {
         Some(p) => p,
         None => return (NULL_HANDLE, NULL_HANDLE),
@@ -696,8 +685,9 @@ unsafe fn make_process(info: &ShimInfo, job_handle: HANDLE) -> (HANDLE, HANDLE) 
     for (key, value) in &info.env_vars {
         let key_w = to_wide_null(key);
         let value_w = to_wide_null(value);
-        if SetEnvironmentVariableW(key_w.as_ptr(), value_w.as_ptr()) == 0 {
-            let err = GetLastError();
+        let ok = unsafe { SetEnvironmentVariableW(key_w.as_ptr(), value_w.as_ptr()) };
+        if ok == 0 {
+            let err = unsafe { GetLastError() };
             unsafe {
                 write_error_wide(&to_wide("Shim: Could not set environment variable '"));
                 write_error_wide(&to_wide(key));
@@ -708,20 +698,22 @@ unsafe fn make_process(info: &ShimInfo, job_handle: HANDLE) -> (HANDLE, HANDLE) 
     }
 
     let cmd_str = {
-        let mut c = quote_arg(path);
+        let mut c = quote_arg(OsStr::new(path));
         for arg in &info.args {
-            c.push(' ');
-            c.push_str(&quote_arg(arg));
+            c.push(b' ' as u16);
+            c.extend_from_slice(&quote_arg(arg));
         }
-        c
+        String::from_utf16_lossy(&c)
     };
     let mut cmd = to_wide_null(&cmd_str);
     let path_w = to_wide_null(path);
 
-    let mut si: STARTUPINFOW = std::mem::zeroed();
+    let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
     si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
-    GetStartupInfoW(&mut si);
-    ensure_standard_handles(&mut si);
+    unsafe {
+        GetStartupInfoW(&mut si);
+        ensure_standard_handles(&mut si);
+    }
 
     let cwd_w = info.cwd.as_ref().map(|c| to_wide_null(c));
     let cwd_ptr = match &cwd_w {
@@ -733,37 +725,58 @@ unsafe fn make_process(info: &ShimInfo, job_handle: HANDLE) -> (HANDLE, HANDLE) 
     // paths need them, so the normal CreateProcessW path never builds the string.
     if info.elevate {
         let params = build_params(&info.args);
-        return launch_elevated(path_w.as_slice(), &params, cwd_ptr, job_handle);
+        return unsafe { launch_elevated(path_w.as_slice(), &params, cwd_ptr, job_handle) };
     }
 
     // SUSPENDED: the child must join the job object before it can spawn its own children.
-    let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
+    let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
 
-    if CreateProcessW(
-        std::ptr::null(),
-        cmd.as_mut_ptr(),
-        std::ptr::null(),
-        std::ptr::null(),
-        1,
-        CREATE_SUSPENDED,
-        std::ptr::null(),
-        cwd_ptr,
-        &mut si,
-        &mut pi,
-    ) != 0
+    if unsafe {
+        CreateProcessW(
+            std::ptr::null(),
+            cmd.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+            CREATE_SUSPENDED,
+            std::ptr::null(),
+            cwd_ptr,
+            &mut si,
+            &mut pi,
+        )
+    } != 0
     {
         if job_handle != NULL_HANDLE {
-            AssignProcessToJobObject(job_handle, pi.hProcess);
+            if unsafe { AssignProcessToJobObject(job_handle, pi.hProcess) } == 0 {
+                unsafe {
+                    write_error_ctx(
+                        "Warning: could not assign process to job object",
+                        GetLastError(),
+                    );
+                }
+            }
         }
-        ResumeThread(pi.hThread);
+        // A failed resume would leave the shim blocked in WaitForSingleObject forever.
+        if unsafe { ResumeThread(pi.hThread) } == u32::MAX {
+            let err = unsafe { GetLastError() };
+            unsafe {
+                write_error_ctx("Could not resume process", err);
+                if job_handle != NULL_HANDLE {
+                    TerminateJobObject(job_handle, 1);
+                }
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+            }
+            std::process::exit(1);
+        }
         return (pi.hProcess, pi.hThread);
     }
 
     // Target manifest requires elevation: retry through ShellExecuteExW.
-    let err = GetLastError();
+    let err = unsafe { GetLastError() };
     if err == ERROR_ELEVATION_REQUIRED {
         let params = build_params(&info.args);
-        return launch_elevated(path_w.as_slice(), &params, cwd_ptr, job_handle);
+        return unsafe { launch_elevated(path_w.as_slice(), &params, cwd_ptr, job_handle) };
     }
 
     unsafe {
@@ -794,10 +807,7 @@ fn main() {
         std::process::exit(1);
     }
 
-    let user_args: Vec<String> = std::env::args_os()
-        .skip(1)
-        .map(|a| a.to_string_lossy().into_owned())
-        .collect();
+    let user_args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let has_user_args = !user_args.is_empty();
 
     for arg_str in user_args {
@@ -827,12 +837,15 @@ fn main() {
             let mut jeli: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
             jeli.BasicLimitInformation.LimitFlags =
                 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK;
-            SetInformationJobObject(
+            let ok = SetInformationJobObject(
                 job_handle,
                 JobObjectExtendedLimitInformation,
                 &jeli as *const _ as *const _,
                 std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
             );
+            if ok == 0 {
+                write_error_ctx("Warning: could not set job object limits", GetLastError());
+            }
         }
     }
 
@@ -842,7 +855,7 @@ fn main() {
         SetConsoleCtrlHandler(Some(ctrl_handler), 1);
     }
 
-    let (process_handle, thread_handle) = unsafe { make_process(&info, job_handle) };
+    let (process_handle, thread_handle) = make_process(&info, job_handle);
 
     if process_handle == NULL_HANDLE {
         std::process::exit(1);

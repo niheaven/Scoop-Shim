@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
 fn main() {
+    println!("cargo:rerun-if-changed=version");
+
     let dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let ver = std::fs::read_to_string(dir.join("version"))
         .expect("failed to read version file")
