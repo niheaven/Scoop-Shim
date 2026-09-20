@@ -20,7 +20,7 @@ const compatible = builtin.zig_version.order(required_version) != .lt;
 pub fn build(b: *std.Build) void {
     if (!compatible) {
         std.log.err("Unsupported Zig compiler version", .{});
-        return;
+        std.process.exit(1);
     }
 
     const optimize = b.standardOptimizeOption(.{});
@@ -33,7 +33,7 @@ pub fn build(b: *std.Build) void {
 
     if (target.result.os.tag != .windows) {
         std.log.err("Non-Windows target is not supported", .{});
-        return;
+        std.process.exit(1);
     }
 
     const exe = b.addExecutable(.{

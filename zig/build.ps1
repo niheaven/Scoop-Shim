@@ -1,4 +1,4 @@
-﻿#Requires -Version 7
+#Requires -Version 7
 
 <#
 .SYNOPSIS
@@ -88,9 +88,13 @@ function Invoke-Build {
   if (-not (Test-Path $exe)) { throw "Output not found: $exe" }
 }
 
-# Clean bin directory
+# Clean only the target's own output directory so sibling architectures survive.
 $binDir = Join-Path $PSScriptRoot 'bin'
-Remove-Item -Path $binDir -Recurse -Force -ErrorAction SilentlyContinue
+if ($Target) {
+  Remove-Item -Path (Join-Path $binDir $Target) -Recurse -Force -ErrorAction SilentlyContinue
+} else {
+  Remove-Item -Path $binDir -Recurse -Force -ErrorAction SilentlyContinue
+}
 
 if ($Target) { Invoke-Build $Target }
 else { foreach ($t in @('x86', 'x64', 'arm64')) { Invoke-Build $t } }
