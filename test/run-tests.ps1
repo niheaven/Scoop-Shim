@@ -76,15 +76,11 @@ function Write-Batch {
 
 # Run a standard console shim test.
 # Setup: scriptblock receiving $testDir, sets up batch files and .shim content
-# RunArgs: arguments passed to the shim executable. Together with CreatorArgs they go
-#           after '--', the separator probe's create mode stops flag parsing at, so both
-#           apply and a RunArg is never eaten as a create flag.
+# RunArgs: arguments passed to the shim executable; with CreatorArgs they follow '--'
+#           so both apply and a RunArg is never eaten as a create flag.
 # Assert: scriptblock receiving @{Output; ExitCode; TestDir; Elapsed} returning $true/$false + message
-# PipeInput: optional string piped to the shim's stdin. Unsupported with CreatorArgs -- the
-#            probe's create mode owns the creator's handles -- so it is ignored there.
-# CreatorArgs: optional probe create flags. Given, the shim is launched through the probe
-#              instead of from PowerShell, which is the only way to control the console the
-#              shim itself starts with; no flag here means the runner's own console.
+# PipeInput: optional string for the shim's stdin; with CreatorArgs it becomes probe's --stdin
+# CreatorArgs: probe create flags -- the only way to control the console the shim starts with
 function Invoke-ShimTest {
     param(
         [string]$Name,
@@ -101,7 +97,9 @@ function Invoke-ShimTest {
         & $Setup $testDir
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
         if ($CreatorArgs.Count -gt 0) {
-            $output = & $probeExe create "$testDir\test.exe" @CreatorArgs -- @RunArgs 2>&1 | Out-String
+            $creatorArgs = @($CreatorArgs)
+            if ($PipeInput) { $creatorArgs += @('--stdin', $PipeInput) }
+            $output = & $probeExe create "$testDir\test.exe" @creatorArgs -- @RunArgs 2>&1 | Out-String
         } elseif ($PipeInput) {
             $output = $PipeInput | & "$testDir\test.exe" @RunArgs 2>&1 | Out-String
         } else {
@@ -882,6 +880,16 @@ Invoke-ShimTest "A shim with a console still shares it with the target" -Setup {
     $report = Join-Path $r.TestDir 'report.txt'
     $got = if (Test-Path $report) { (Get-Content $report -Raw).Trim() } else { '(no report)' }
     @{ Pass = ($got -match 'console=1'); Message = "Report: $got" }
+}
+
+# The target's answer only reaches the runner because probe forwards its own stdout
+# down to a console-less child.
+Invoke-ShimTest "Console-less creator still feeds the target's stdin" -Setup {
+    param($d)
+    Write-Shim $d "test" "path = $probeExe`nargs = stdin"
+} -CreatorArgs @('--detached') -PipeInput "PIPE_FROM_GUI_HOST" -Assert {
+    param($r)
+    @{ Pass = ($r.Output -match '(?m)^GOT=PIPE_FROM_GUI_HOST\r?$'); Message = "Output: $($r.Output)" }
 }
 
 # --- Null-stream creator ---------------------------------------------------------

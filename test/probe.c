@@ -15,7 +15,7 @@
  *                              is GetConsoleWindow() != NULL: a windowless console
  *                              is still a console, so the two differ.
  *
- *   create <exe> [--null-out|--default] [--detached] [-- <args>...]
+ *   create <exe> [--null-out|--default] [--detached] [--stdin <text>] [-- <args>...]
  *                              Launch <exe> as a creator. --null-out sets
  *                              STARTF_USESTDHANDLES while passing stdout as NULL
  *                              and stdin/stderr as pipes, which is the shape Go's
@@ -29,6 +29,13 @@
  *                              --detached adds DETACHED_PROCESS, which leaves the
  *                              child with no console at all -- the state a GUI
  *                              host's detached windowless spawn produces.
+ *                              --stdin <text> pipes <text> to the child's stdin,
+ *                              newline appended when it lacks one, and pipes all
+ *                              three streams. stdout/stderr are probe's own
+ *                              handles, so a console-less child's output still
+ *                              reaches the runner, and no stream is nulled so
+ *                              the CONIN$/CONOUT$ fallback stays inert. It
+ *                              contradicts --null-out; the pair exits 5.
  *
  *   args <arg>...              One "Arg N is <value>" line per argument, index
  *                              zero-based, value UTF-8 and unescaped, after a
@@ -377,7 +384,7 @@ static void do_touch(const wchar_t *path)
 /* Global so the command line does not land on the stack. */
 static wchar_t g_cmd[CMD_MAX];
 
-static int create(const wchar_t *exe, int nullOut, int detached, int firstArg)
+static int create(const wchar_t *exe, int nullOut, int detached, const wchar_t *stdinText, int firstArg)
 {
     int len = 0;
 
@@ -426,7 +433,33 @@ static int create(const wchar_t *exe, int nullOut, int detached, int firstArg)
     HANDLE inRd = NULL, inWr = NULL, erRd = NULL, erWr = NULL;
     BOOL inherit = FALSE;
 
-    if (nullOut) {
+    if (stdinText) {
+        /* Closing the write end gives the child EOF; the read end may stay open,
+         * this process exits right after the child does. */
+        static char feed[ARGS_BUF];
+        int cb = WideCharToMultiByte(CP_UTF8, 0, stdinText, wlen(stdinText), feed,
+                                     (int)sizeof(feed) - 2, NULL, NULL);
+        DWORD wrote = 0;
+
+        if (cb < 0) cb = 0;
+        if (cb == 0 || feed[cb - 1] != '\n') feed[cb++] = '\n';
+
+        if (!CreatePipe(&inRd, &inWr, &sa, 0)) return 3;
+        SetHandleInformation(inWr, HANDLE_FLAG_INHERIT, 0);
+        WriteFile(inWr, feed, (DWORD)cb, &wrote, NULL);
+        CloseHandle(inWr);
+        inWr = NULL;
+
+        /* A handle probe inherited is not automatically inheritable by probe's child. */
+        SetHandleInformation(GetStdHandle(STD_OUTPUT_HANDLE), HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+        SetHandleInformation(GetStdHandle(STD_ERROR_HANDLE), HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdInput = inRd;
+        si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+        si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+        inherit = TRUE;
+    } else if (nullOut) {
         if (!CreatePipe(&inRd, &inWr, &sa, 0)) return 3;
         if (!CreatePipe(&erRd, &erWr, &sa, 0)) return 3;
         SetHandleInformation(inWr, HANDLE_FLAG_INHERIT, 0);
@@ -450,6 +483,14 @@ static int create(const wchar_t *exe, int nullOut, int detached, int firstArg)
     return (int)code;
 }
 
+/* Exit 5, so a bad flag combination is told apart from the usage fallthrough's arity error. */
+static void usage_error(const char *msg)
+{
+    DWORD n = 0;
+    WriteFile(GetStdHandle(STD_ERROR_HANDLE), msg, lstrlenA(msg), &n, NULL);
+    ExitProcess(5);
+}
+
 void __stdcall probe_entry(void)
 {
     parse_cmdline();
@@ -463,6 +504,7 @@ void __stdcall probe_entry(void)
         int i = 3;
         int nullOut = 0;
         int detached = 0;
+        const wchar_t *stdinText = NULL;
 
         /* Flags are order-independent so a test can pair --detached with either
          * stdio shape without depending on argument order. */
@@ -470,11 +512,20 @@ void __stdcall probe_entry(void)
             if (arg_is(i, L"--null-out")) { nullOut = 1; i++; }
             else if (arg_is(i, L"--default")) { i++; }
             else if (arg_is(i, L"--detached")) { detached = 1; i++; }
+            else if (arg_is(i, L"--stdin")) {
+                if (i + 1 >= g_argc) usage_error("probe: --stdin needs the text to feed\n");
+                stdinText = g_argv[i + 1];
+                i += 2;
+            }
             else break;
         }
+
+        /* Letting either win would report a shape the creator never built. */
+        if (stdinText && nullOut) usage_error("probe: --stdin cannot be combined with --null-out\n");
+
         if (arg_is(i, L"--")) i++;
 
-        ExitProcess((UINT)create(g_argv[2], nullOut, detached, i));
+        ExitProcess((UINT)create(g_argv[2], nullOut, detached, stdinText, i));
     }
 
     if (arg_is(1, L"args")) {
@@ -524,7 +575,7 @@ void __stdcall probe_entry(void)
 
     static const wchar_t usage[] =
         L"usage: probe report <file>\n"
-        L"       probe create <exe> [--null-out|--default] [--detached] [-- args...]\n"
+        L"       probe create <exe> [--null-out|--default] [--detached] [--stdin <text>] [-- args...]\n"
         L"       probe args <arg>...\n"
         L"       probe env [name...] | cwd | echo|echoerr <text...>\n"
         L"       probe exit [code] | stdin | wait <ms> | touch <file>\n";
