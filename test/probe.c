@@ -6,13 +6,16 @@
  *   report <file>              Report the standard handles this process was given.
  *                              A managed host (pwsh, .NET) repairs an invalid
  *                              stdout handle during startup, which hides exactly
- *                              the defect these tests exist to catch. Nothing here
- *                              touches stdio except to read its state. Writes one
- *                              line: stdout_valid= stdout_type= stdout_is_console=
- *                              [stdout_inherit=] stdout_write=, where 2 is
- *                              FILE_TYPE_CHAR.
+ *                              the defect these tests exist to catch. Nothing in
+ *                              this mode touches stdio except to read its state.
+ *                              Writes one line: stdout_valid= stdout_type=
+ *                              stdout_is_console= [stdout_inherit=] stdout_write=
+ *                              console= window=, where 2 is FILE_TYPE_CHAR.
+ *                              console= is GetConsoleProcessList != 0 and window=
+ *                              is GetConsoleWindow() != NULL: a windowless console
+ *                              is still a console, so the two differ.
  *
- *   create <exe> [--null-out|--default] [-- <args>...]
+ *   create <exe> [--null-out|--default] [--detached] [-- <args>...]
  *                              Launch <exe> as a creator. --null-out sets
  *                              STARTF_USESTDHANDLES while passing stdout as NULL
  *                              and stdin/stderr as pipes, which is the shape Go's
@@ -23,6 +26,9 @@
  *                              application resolves the console's own handles. A
  *                              console is allocated first, so the outcome does not
  *                              depend on what the runner happens to have.
+ *                              --detached adds DETACHED_PROCESS, which leaves the
+ *                              child with no console at all -- the state a GUI
+ *                              host's detached windowless spawn produces.
  *
  *   args <arg>...              One "Arg N is <value>" line per argument, index
  *                              zero-based, value UTF-8 and unescaped, after a
@@ -170,6 +176,14 @@ static void report(const wchar_t *path)
     int valid = (h != NULL && h != INVALID_HANDLE_VALUE) ? 1 : 0;
     int writable = WriteFile(h, "", 0, NULL, NULL) ? 1 : 0;
 
+    /* GetConsoleProcessList needs a real buffer: a NULL list with count 0 is
+     * documented misuse and returns 0 with ERROR_INVALID_PARAMETER regardless of
+     * whether a console is attached. GetConsoleWindow cannot stand in for this,
+     * because it is NULL both with no console and with a windowless one. */
+    DWORD consolePid = 0;
+    int hasConsole = GetConsoleProcessList(&consolePid, 1) != 0;
+    int hasWindow = GetConsoleWindow() != NULL ? 1 : 0;
+
     char *p = line;
     p = put_str(p, "stdout_valid=");
     p = put_num(p, (unsigned long)valid);
@@ -183,6 +197,10 @@ static void report(const wchar_t *path)
     }
     p = put_str(p, " stdout_write=");
     p = put_num(p, (unsigned long)writable);
+    p = put_str(p, " console=");
+    p = put_num(p, (unsigned long)hasConsole);
+    p = put_str(p, " window=");
+    p = put_num(p, (unsigned long)hasWindow);
     *p++ = '\n';
 
     HANDLE f = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -359,7 +377,7 @@ static void do_touch(const wchar_t *path)
 /* Global so the command line does not land on the stack. */
 static wchar_t g_cmd[CMD_MAX];
 
-static int create(const wchar_t *exe, int nullOut, int firstArg)
+static int create(const wchar_t *exe, int nullOut, int detached, int firstArg)
 {
     int len = 0;
 
@@ -421,7 +439,8 @@ static int create(const wchar_t *exe, int nullOut, int firstArg)
     }
 
     PROCESS_INFORMATION pi;
-    if (!CreateProcessW(exe, g_cmd, NULL, NULL, inherit, 0, NULL, NULL, &si, &pi)) return 4;
+    DWORD flags = detached ? DETACHED_PROCESS : 0;
+    if (!CreateProcessW(exe, g_cmd, NULL, NULL, inherit, flags, NULL, NULL, &si, &pi)) return 4;
 
     WaitForSingleObject(pi.hProcess, INFINITE);
     DWORD code = 1;
@@ -443,16 +462,19 @@ void __stdcall probe_entry(void)
     if (arg_is(1, L"create") && g_argc >= 3) {
         int i = 3;
         int nullOut = 0;
+        int detached = 0;
 
-        if (arg_is(i, L"--null-out")) {
-            nullOut = 1;
-            i++;
-        } else if (arg_is(i, L"--default")) {
-            i++;
+        /* Flags are order-independent so a test can pair --detached with either
+         * stdio shape without depending on argument order. */
+        for (;;) {
+            if (arg_is(i, L"--null-out")) { nullOut = 1; i++; }
+            else if (arg_is(i, L"--default")) { i++; }
+            else if (arg_is(i, L"--detached")) { detached = 1; i++; }
+            else break;
         }
         if (arg_is(i, L"--")) i++;
 
-        ExitProcess((UINT)create(g_argv[2], nullOut, i));
+        ExitProcess((UINT)create(g_argv[2], nullOut, detached, i));
     }
 
     if (arg_is(1, L"args")) {
@@ -502,7 +524,7 @@ void __stdcall probe_entry(void)
 
     static const wchar_t usage[] =
         L"usage: probe report <file>\n"
-        L"       probe create <exe> [--null-out|--default] [-- args...]\n"
+        L"       probe create <exe> [--null-out|--default] [--detached] [-- args...]\n"
         L"       probe args <arg>...\n"
         L"       probe env [name...] | cwd | echo|echoerr <text...>\n"
         L"       probe exit [code] | stdin | wait <ms> | touch <file>\n";
