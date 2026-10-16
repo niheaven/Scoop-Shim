@@ -76,16 +76,23 @@ function Write-Batch {
 
 # Run a standard console shim test.
 # Setup: scriptblock receiving $testDir, sets up batch files and .shim content
-# RunArgs: arguments passed to the shim executable
+# RunArgs: arguments passed to the shim executable. Together with CreatorArgs they go
+#           after '--', the separator probe's create mode stops flag parsing at, so both
+#           apply and a RunArg is never eaten as a create flag.
 # Assert: scriptblock receiving @{Output; ExitCode; TestDir; Elapsed} returning $true/$false + message
-# PipeInput: optional string piped to the shim's stdin
+# PipeInput: optional string piped to the shim's stdin. Unsupported with CreatorArgs -- the
+#            probe's create mode owns the creator's handles -- so it is ignored there.
+# CreatorArgs: optional probe create flags. Given, the shim is launched through the probe
+#              instead of from PowerShell, which is the only way to control the console the
+#              shim itself starts with; no flag here means the runner's own console.
 function Invoke-ShimTest {
     param(
         [string]$Name,
         [Parameter(Mandatory=$true)][scriptblock]$Setup,
         [string[]]$RunArgs = @(),
         [Parameter(Mandatory=$true)][scriptblock]$Assert,
-        [string]$PipeInput = $null
+        [string]$PipeInput = $null,
+        [string[]]$CreatorArgs = @()
     )
     $script:TestNumber++
     $num = $script:TestNumber
@@ -93,7 +100,9 @@ function Invoke-ShimTest {
     try {
         & $Setup $testDir
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        if ($PipeInput) {
+        if ($CreatorArgs.Count -gt 0) {
+            $output = & $probeExe create "$testDir\test.exe" @CreatorArgs -- @RunArgs 2>&1 | Out-String
+        } elseif ($PipeInput) {
             $output = $PipeInput | & "$testDir\test.exe" @RunArgs 2>&1 | Out-String
         } else {
             $output = & "$testDir\test.exe" @RunArgs 2>&1 | Out-String
@@ -846,6 +855,33 @@ Invoke-GuiShimTest "GUI shim exit code (7)" -Setup {
 } -Assert {
     param($r)
     @{ Pass = $r.ExitCode -eq 7; Message = "Expected: 7, Got: $($r.ExitCode)" }
+}
+
+# --- Target console ------------------------------------------------------------
+
+# DETACHED_PROCESS is what leaves the shim console-less (CREATE_NO_WINDOW is ignored
+# beside it); the host's other flag, CREATE_NEW_PROCESS_GROUP, only reroutes Ctrl+C.
+# Only the probe can build this creator -- PowerShell always gives the shim a console.
+
+Invoke-ShimTest "Console-less creator gives the target no window" -Setup {
+    param($d)
+    Write-Shim $d "test" "path = $probeExe`nargs = report $d\report.txt"
+} -CreatorArgs @('--detached') -Assert {
+    param($r)
+    $report = Join-Path $r.TestDir 'report.txt'
+    $got = if (Test-Path $report) { (Get-Content $report -Raw).Trim() } else { '(no report)' }
+    # window=1 is never asserted: this runner's own console has no window.
+    @{ Pass = ($got -match 'window=0'); Message = "Report: $got" }
+}
+
+Invoke-ShimTest "A shim with a console still shares it with the target" -Setup {
+    param($d)
+    Write-Shim $d "test" "path = $probeExe`nargs = report $d\report.txt"
+} -Assert {
+    param($r)
+    $report = Join-Path $r.TestDir 'report.txt'
+    $got = if (Test-Path $report) { (Get-Content $report -Raw).Trim() } else { '(no report)' }
+    @{ Pass = ($got -match 'console=1'); Message = "Report: $got" }
 }
 
 # --- Null-stream creator ---------------------------------------------------------
