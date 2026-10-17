@@ -933,6 +933,19 @@ $num = $script:TestNumber
 $sub = Get-PESubsystem -FilePath $ShimExe
 Write-TestResult "#$num Console shim subsystem is CUI" ($sub -eq 3) "Subsystem: $sub (expected 3)"
 
+# The manifest is asserted as a resource, never by searching the binary's bytes: a
+# toolchain that emitted it as a named resource leaves the loader ignoring it with no
+# error anywhere. probe reads it as type 24 by number and id 1 by number, which is what
+# turns that trap into a failure here.
+$script:TestNumber++
+$num = $script:TestNumber
+$manifest = & $probeExe manifest $ShimExe 2>&1 | Out-String
+Write-TestResult "#$num Shim manifest carries longPathAware and consoleAllocationPolicy" `
+    (($manifest -match '>true</longPathAware>') -and
+     ($manifest -match '>detached</consoleAllocationPolicy>') -and
+     ($manifest -match 'SMI/2024/WindowsSettings')) `
+    "Manifest: $manifest"
+
 # ============================================================================
 # Summary
 # ============================================================================

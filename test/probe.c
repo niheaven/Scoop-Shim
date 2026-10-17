@@ -15,6 +15,18 @@
  *                              is GetConsoleWindow() != NULL: a windowless console
  *                              is still a console, so the two differ.
  *
+ *   manifest <exe>             Write <exe>'s embedded manifest, raw UTF-8, to
+ *                              stdout. The image is mapped as data, which runs
+ *                              nothing and reads either architecture, and the
+ *                              resource is looked up as type 24 by number and ID
+ *                              1 by number. That numeric lookup is the point: a
+ *                              cross-compiling toolchain that emitted the manifest
+ *                              as a *named* resource -- which the loader ignores
+ *                              without any error -- makes this lookup fail instead.
+ *                              One stderr line and a distinct non-zero exit when
+ *                              the image or the resource is absent, so a missing
+ *                              manifest reads as a failure, not as empty output.
+ *
  *   create <exe> [--null-out|--default] [--detached] [--stdin <text>] [-- <args>...]
  *                              Launch <exe> as a creator. --null-out sets
  *                              STARTF_USESTDHANDLES while passing stdout as NULL
@@ -491,12 +503,47 @@ static void usage_error(const char *msg)
     ExitProcess(5);
 }
 
+/* The manifest's own failure exit: 6, apart from the usage fallthrough's 1 and
+ * usage_error's 5. */
+static void manifest_error(const char *msg)
+{
+    DWORD n = 0;
+    WriteFile(GetStdHandle(STD_ERROR_HANDLE), msg, lstrlenA(msg), &n, NULL);
+    ExitProcess(6);
+}
+
+/* manifest <exe>: dump the embedded manifest resource, raw. Mapping as data runs
+ * nothing and is architecture-agnostic. Type 24 and ID 1 both by number, never by
+ * a resolved symbol: an llvm-rc that named the resource leaves the loader ignoring
+ * it with no error anywhere, and this lookup is what turns that into a visible
+ * failure (RATIONALE.md). */
+static void print_manifest(const wchar_t *path)
+{
+    HMODULE h = LoadLibraryExW(path, NULL, LOAD_LIBRARY_AS_DATAFILE);
+    DWORD written = 0;
+
+    if (!h) manifest_error("probe: cannot map the image\n");
+    HRSRC res = FindResourceW(h, MAKEINTRESOURCEW(1), MAKEINTRESOURCEW(24));
+    if (!res) manifest_error("probe: no manifest resource (type 24, id 1)\n");
+    HGLOBAL data = LoadResource(h, res);
+    if (!data) manifest_error("probe: cannot load the manifest resource\n");
+    const void *bytes = LockResource(data);
+    DWORD size = SizeofResource(h, res);
+    if (!bytes || size == 0) manifest_error("probe: empty manifest resource\n");
+    WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), bytes, size, &written, NULL);
+}
+
 void __stdcall probe_entry(void)
 {
     parse_cmdline();
 
     if (arg_is(1, L"report") && g_argc >= 3) {
         report(g_argv[2]);
+        ExitProcess(0);
+    }
+
+    if (arg_is(1, L"manifest") && g_argc >= 3) {
+        print_manifest(g_argv[2]);
         ExitProcess(0);
     }
 
@@ -575,6 +622,7 @@ void __stdcall probe_entry(void)
 
     static const wchar_t usage[] =
         L"usage: probe report <file>\n"
+        L"       probe manifest <exe>\n"
         L"       probe create <exe> [--null-out|--default] [--detached] [--stdin <text>] [-- args...]\n"
         L"       probe args <arg>...\n"
         L"       probe env [name...] | cwd | echo|echoerr <text...>\n"
