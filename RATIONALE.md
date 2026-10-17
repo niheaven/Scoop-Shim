@@ -8,7 +8,7 @@ A launcher, not a wrapper. It reads a small text file, prepares a process, spawn
 
 Two consequences run through the whole design.
 
-**Nothing may be in the way.** The shim holds the console while the child runs, so anything the shim prints or reacts to lands between the user and the program they asked for. That is why errors go directly to the stderr handle -- `WriteConsoleW` when it is a console, UTF-8 via `WriteFile` otherwise -- and never through stdio: a block-buffered stream would hold the shim's diagnostic until exit and print it *after* everything the child had already said, putting the message in the wrong place in the transcript. A pure-ASCII fragment may go through either writer, because both render it identically, which is why the rust and zig lanes bypass the routing for a few literals.
+**Nothing may be in the way.** The shim holds the console while the child runs, so anything the shim prints or reacts to lands between the user and the program they asked for. That is why errors go directly to the stderr handle -- `WriteConsoleW` when it is a console, UTF-8 via `WriteFile` otherwise -- and never through stdio: a block-buffered stream would hold the shim's diagnostic until exit and print it *after* everything the child had already said. A pure-ASCII fragment may go through either writer, because both render it identically, which is why the rust and zig lanes bypass the routing for a few literals.
 
 **There is no runtime to install and nothing to clean up.** The shim is one source file per lane compiled to a single executable. Direct Win32 calls, no wrapper library, no helper process.
 
@@ -37,7 +37,7 @@ The shim is not supposed to outlive its job, and the child is not supposed to ou
 
 **A job object ties them together.** `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` means the child dies when the shim does, so a closed console window does not leave an orphaned process behind. `JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK` scopes that to the *direct* child: a process the tool deliberately detaches, or a server it spawns, is its own business. Owning the whole tree would break exactly the tools a launcher exists to run.
 
-**The child is created suspended.** It has to be in the job before it can spawn anything of its own. Without `CREATE_SUSPENDED` there is a window between creation and job assignment in which the child can start a grandchild, and that grandchild escapes the job. This holds for the `CreateProcessW` path only. `ShellExecuteExW` has no suspended option, so an elevated child is already running when it joins the job and that window is open there; the retry after `ERROR_ELEVATION_REQUIRED` launches the same way.
+**The child is created suspended.** It has to be in the job before it can spawn anything of its own. Without `CREATE_SUSPENDED` there is a window between creation and job assignment in which the child can start a grandchild, and that grandchild escapes the job. This holds for the `CreateProcessW` path only; `ShellExecuteExW` has no suspended option, so the elevated path and its `ERROR_ELEVATION_REQUIRED` retry keep that window open (see Elevation).
 
 **The console belongs to the child.** The shim swallows every console control event and returns `TRUE`. The user is interacting with the program the shim launched, so Ctrl+C has to reach it and not the shim -- and if the shim died on Ctrl+C, `KILL_ON_JOB_CLOSE` would take the child down with it. The handler is installed *before* the spawn, which closes the remaining window where a Ctrl event would kill the shim and the child with it.
 
